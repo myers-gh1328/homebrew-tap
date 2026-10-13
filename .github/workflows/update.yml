@@ -1,0 +1,66 @@
+name: Update formulas
+
+# Points each formula at its project's newest GitHub release. Runs every
+# six hours and on demand; only release data is read, and the push uses
+# this repository's own token.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-formulas
+  cancel-in-progress: false
+
+jobs:
+  guarded-update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update guarded-update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: myers-gh1328/guarded-update
+          FORMULA: Formula/guarded-update.rb
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$REPO" --json tagName --jq .tagName)
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "unexpected tag: $tag" >&2
+            exit 1
+          fi
+          version=${tag#v}
+          current=$(sed -nE 's/^  version "([^"]+)"$/\1/p' "$FORMULA")
+          if [ "$version" = "$current" ]; then
+            echo "guarded-update is already at $version"
+            exit 0
+          fi
+          dir=$(mktemp -d)
+          gh release download "$tag" --repo "$REPO" --pattern '*.tar.gz.sha256' --dir "$dir"
+          sum() {
+            local s
+            s=$(cut -d' ' -f1 "$dir/guarded-update-$tag-$1.tar.gz.sha256")
+            [[ "$s" =~ ^[0-9a-f]{64}$ ]] || { echo "bad checksum for $1" >&2; exit 1; }
+            echo "$s"
+          }
+          mac=$(sum aarch64-apple-darwin)
+          linux=$(sum aarch64-unknown-linux-gnu)
+          # Each sha256 line follows the url line of its own target.
+          awk -v v="$version" -v mac="$mac" -v linux="$linux" '
+            /^  version "/ { sub(/"[^"]+"/, "\"" v "\"") }
+            /aarch64-apple-darwin/ { want = mac }
+            /aarch64-unknown-linux-gnu/ { want = linux }
+            /^ +sha256 "/ && want != "" { sub(/"[^"]+"/, "\"" want "\""); want = "" }
+            { print }
+          ' "$FORMULA" > "$dir/formula.rb"
+          mv "$dir/formula.rb" "$FORMULA"
+          ruby -c "$FORMULA"
+          git diff --stat
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "guarded-update $version"
+          git push
